@@ -216,3 +216,6 @@ tags
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,python,vim
 
 wandb/
+eval*/
+logs*/
+paper_results*/

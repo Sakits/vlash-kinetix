@@ -15,10 +15,12 @@ import kinetix.environment.env_state as kenv_state
 import kinetix.environment.wrappers as wrappers
 import kinetix.render.renderer_pixels as renderer_pixels
 import pandas as pd
+from tqdm import tqdm
 import tyro
 
 import model as _model
 import train_expert
+import compute_robot_indices
 
 
 @dataclasses.dataclass(frozen=True)
@@ -39,6 +41,18 @@ class BIDMethodConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class VLASHMethodConfig:
+    """Visual Lag, Actual State Hybrid - simulate robot state after executing delay actions"""
+    with_noise: bool = False  # If True, use different RNG for simulation to introduce prediction error
+
+
+@dataclasses.dataclass(frozen=True)
+class OracleMethodConfig:
+    """Oracle - use fully simulated future observation (no delay, perfect information)"""
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
 class EvalConfig:
     step: int = -1
     weak_step: int | None = None
@@ -47,7 +61,7 @@ class EvalConfig:
 
     inference_delay: int = 0
     execute_horizon: int = 1
-    method: NaiveMethodConfig | RealtimeMethodConfig | BIDMethodConfig = NaiveMethodConfig()
+    method: NaiveMethodConfig | RealtimeMethodConfig | BIDMethodConfig | VLASHMethodConfig | OracleMethodConfig = NaiveMethodConfig()
 
     model: _model.ModelConfig = _model.ModelConfig()
 
@@ -61,6 +75,7 @@ def eval(
     env_params: kenv_state.EnvParams,
     static_env_params: kenv_state.EnvParams,
     weak_policy: _model.FlowPolicy | None = None,
+    robot_mask: jax.Array | None = None,
 ):
     env = train_expert.BatchEnvWrapper(
         wrappers.LogWrapper(wrappers.AutoReplayWrapper(train_expert.NoisyActionWrapper(env))), config.num_evals
@@ -113,28 +128,70 @@ def eval(
                 bid_k=config.method.bid_k,
                 bid_weak_policy=weak_policy if config.method.bid_k is not None else None,
             )
+        elif isinstance(config.method, (VLASHMethodConfig, OracleMethodConfig)):
+            # VLASH: mix env@current + robot@simulated_future
+            # Oracle: use fully simulated future observation
+            is_vlash = isinstance(config.method, VLASHMethodConfig)
+            if is_vlash:
+                assert robot_mask is not None, "robot_mask is required for VLASH"
+            
+            @jax.vmap
+            def simulate_future_state(rng_sim, obs_current, env_state_wrapped, prev_actions):
+                if config.inference_delay > 0:
+                    def sim_step(carry, action):
+                        state_wrapped, rng_carry = carry
+                        rng_next, key_step = jax.random.split(rng_carry)
+                        obs_next, next_state_wrapped, _, _, _ = env._env.step(
+                            key_step, state_wrapped, action, env_params
+                        )
+                        return (next_state_wrapped, rng_next), obs_next
+                    
+                    (_, _), obs_sequence = jax.lax.scan(
+                        sim_step, (env_state_wrapped, rng_sim), prev_actions[:config.inference_delay]
+                    )
+                    obs_future = obs_sequence[-1]
+                else:
+                    obs_future = obs_current
+                
+                # VLASH: mix using robot_mask; Oracle: use full future
+                if is_vlash:
+                    return jnp.where(robot_mask, obs_future, obs_current)
+                return obs_future
+            
+            # VLASH with_noise=True: use different RNG to introduce prediction error
+            # VLASH with_noise=False / Oracle: use same RNG for perfect noise prediction
+            use_noise = is_vlash and config.method.with_noise
+            if use_noise:
+                rng, rng_for_sim = jax.random.split(rng)
+            else:
+                rng_for_sim = rng
+            obs_for_policy = simulate_future_state(
+                jax.random.split(rng_for_sim, config.num_evals), obs, env_state, action_chunk
+            )
+            next_action_chunk = policy.action(key, obs_for_policy, config.num_flow_steps)
         else:
             raise ValueError(f"Unknown method: {config.method}")
 
-        # we execute `inference_delay` actions from the *previously generated* action chunk, and then the remaining
-        # `execute_horizon - inference_delay` actions from the newly generated action chunk
-        action_chunk_to_execute = jnp.concatenate(
-            [
-                action_chunk[:, : config.inference_delay],
-                next_action_chunk[:, config.inference_delay : config.execute_horizon],
-            ],
-            axis=1,
-        )
-        # throw away the first `execute_horizon` actions from the newly generated action chunk, to align it with the
-        # correct frame of reference for the next scan iteration
-        next_action_chunk = jnp.concatenate(
-            [
-                next_action_chunk[:, config.execute_horizon :],
-                jnp.zeros((obs.shape[0], config.execute_horizon, policy.action_dim)),
-            ],
-            axis=1,
-        )
-        next_n = jnp.concatenate([n[config.execute_horizon :], jnp.zeros(config.execute_horizon, dtype=jnp.int32)])
+        # Build action chunk to execute and shift for next iteration
+        if isinstance(config.method, (VLASHMethodConfig, OracleMethodConfig)):
+            # VLASH/Oracle: next_action_chunk generated with simulated future obs
+            shift = config.execute_horizon - config.inference_delay
+            action_chunk_to_execute = jnp.concatenate(
+                [action_chunk[:, :config.inference_delay], next_action_chunk[:, :shift]], axis=1
+            )
+            next_action_chunk = jnp.concatenate(
+                [next_action_chunk[:, shift:], jnp.zeros((obs.shape[0], shift, policy.action_dim))], axis=1
+            )
+            next_n = jnp.concatenate([n[shift:], jnp.zeros(shift, dtype=jnp.int32)])
+        else:
+            # Other methods: next_action_chunk generated with current obs
+            action_chunk_to_execute = jnp.concatenate(
+                [action_chunk[:, :config.inference_delay], next_action_chunk[:, config.inference_delay:config.execute_horizon]], axis=1
+            )
+            next_action_chunk = jnp.concatenate(
+                [next_action_chunk[:, config.execute_horizon:], jnp.zeros((obs.shape[0], config.execute_horizon, policy.action_dim))], axis=1
+            )
+            next_n = jnp.concatenate([n[config.execute_horizon:], jnp.zeros(config.execute_horizon, dtype=jnp.int32)])
         (rng, next_obs, next_env_state), (dones, env_states, infos) = jax.lax.scan(
             step, (rng, obs, env_state), action_chunk_to_execute.transpose(1, 0, 2)
         )
@@ -187,6 +244,8 @@ def main(
     ),
     seed: int = 0,
     output_dir: str | None = "eval_output",
+    parallel_index: int | None = None,
+    parallel_total: int | None = None,
 ):
     static_env_params = kenv_state.StaticEnvParams(**train_expert.LARGE_ENV_PARAMS, frame_skip=train_expert.FRAME_SKIP)
     env_params = kenv_state.EnvParams()
@@ -223,15 +282,16 @@ def main(
     pspec = jax.sharding.PartitionSpec("x")
     sharding = jax.sharding.NamedSharding(mesh, pspec)
 
+    # Compute robot masks for VLASH/Oracle
+    robot_masks = jnp.stack([compute_robot_indices.compute_robot_mask(p, obs_dim) for p in level_paths])
+    robot_masks = jax.device_put(robot_masks, sharding)
+
     @functools.partial(jax.jit, static_argnums=(0,), in_shardings=sharding, out_shardings=sharding)
-    @functools.partial(shard_map.shard_map, mesh=mesh, in_specs=(None, pspec, pspec, pspec, pspec), out_specs=pspec)
-    @functools.partial(jax.vmap, in_axes=(None, 0, 0, 0, 0))
-    def _eval(config: EvalConfig, rng: jax.Array, level: kenv_state.EnvState, state_dict, weak_state_dict):
+    @functools.partial(shard_map.shard_map, mesh=mesh, in_specs=(None, pspec, pspec, pspec, pspec, pspec), out_specs=pspec)
+    @functools.partial(jax.vmap, in_axes=(None, 0, 0, 0, 0, 0))
+    def _eval(config: EvalConfig, rng: jax.Array, level: kenv_state.EnvState, state_dict, weak_state_dict, robot_mask):
         policy = _model.FlowPolicy(
-            obs_dim=obs_dim,
-            action_dim=action_dim,
-            config=config.model,
-            rngs=nnx.Rngs(rng),
+            obs_dim=obs_dim, action_dim=action_dim, config=config.model, rngs=nnx.Rngs(rng),
         )
         graphdef, state = nnx.split(policy)
         state.replace_by_pure_dict(state_dict)
@@ -242,67 +302,47 @@ def main(
             weak_policy = nnx.merge(graphdef, state)
         else:
             weak_policy = None
-        eval_info, _ = eval(config, env, rng, level, policy, env_params, static_env_params, weak_policy)
+        eval_info, _ = eval(config, env, rng, level, policy, env_params, static_env_params, weak_policy, robot_mask)
         return eval_info
+
+    # Build evaluation tasks
+    # methods = ["naive", "realtime", "bid", "vlash", "vlash_w_noise", "oracle"]
+    methods = ["vlash", "vlash_w_noise", "oracle"]
+    delay_horizon_pairs = [(d, max(1, d)) for d in range(8)] + [(1, h) for h in range(2, 9)]
+    all_tasks = [(d, h, m) for d, h in delay_horizon_pairs for m in methods]
+    
+    if parallel_index is not None and parallel_total is not None:
+        all_tasks = [t for i, t in enumerate(all_tasks) if i % parallel_total == parallel_index]
+        print(f"Parallel {parallel_index}/{parallel_total}: {len(all_tasks)} tasks")
 
     rngs = jax.random.split(jax.random.key(seed), len(level_paths))
     results = collections.defaultdict(list)
-    for inference_delay in [0, 1, 2, 3, 4]:
-        for execute_horizon in range(max(1, inference_delay), 8 - inference_delay + 1):
-            print(f"{inference_delay=} {execute_horizon=}")
-            c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=NaiveMethodConfig()
-            )
-            out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
-            for i in range(len(level_paths)):
-                for k, v in out.items():
-                    results[k].append(v[i])
-                results["delay"].append(inference_delay)
-                results["method"].append("naive")
-                results["level"].append(level_paths[i])
-                results["execute_horizon"].append(execute_horizon)
+    
+    desc = f"GPU{parallel_index}" if parallel_index is not None else "Eval"
+    for delay, horizon, method_name in tqdm(all_tasks, desc=desc, ncols=80):
+        method_config = {
+            "naive": NaiveMethodConfig(),
+            "realtime": RealtimeMethodConfig(),
+            "bid": BIDMethodConfig(),
+            "vlash": VLASHMethodConfig(with_noise=False),
+            "vlash_w_noise": VLASHMethodConfig(with_noise=True),
+            "oracle": OracleMethodConfig(),
+        }[method_name]
+        
+        c = dataclasses.replace(config, inference_delay=delay, execute_horizon=horizon, method=method_config)
+        out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts, robot_masks))
+        
+        for i in range(len(level_paths)):
+            for k, v in out.items():
+                results[k].append(v[i])
+            results["delay"].append(delay)
+            results["method"].append(method_name)
+            results["level"].append(level_paths[i])
+            results["execute_horizon"].append(horizon)
 
-            c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=RealtimeMethodConfig()
-            )
-            out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
-            for i in range(len(level_paths)):
-                for k, v in out.items():
-                    results[k].append(v[i])
-                results["delay"].append(inference_delay)
-                results["method"].append("realtime")
-                results["level"].append(level_paths[i])
-                results["execute_horizon"].append(execute_horizon)
-
-            c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=BIDMethodConfig()
-            )
-            out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
-            for i in range(len(level_paths)):
-                for k, v in out.items():
-                    results[k].append(v[i])
-                results["delay"].append(inference_delay)
-                results["method"].append("bid")
-                results["level"].append(level_paths[i])
-                results["execute_horizon"].append(execute_horizon)
-
-            c = dataclasses.replace(
-                config,
-                inference_delay=inference_delay,
-                execute_horizon=execute_horizon,
-                method=RealtimeMethodConfig(prefix_attention_schedule="zeros"),
-            )
-            out = jax.device_get(_eval(c, rngs, levels, state_dicts, weak_state_dicts))
-            for i in range(len(level_paths)):
-                for k, v in out.items():
-                    results[k].append(v[i])
-                results["delay"].append(inference_delay)
-                results["method"].append("hard_masking")
-                results["level"].append(level_paths[i])
-                results["execute_horizon"].append(execute_horizon)
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(results)
-    df.to_csv(pathlib.Path(output_dir) / "results.csv", index=False)
+    output_file = f"results_part_{parallel_index}.csv" if parallel_index is not None else "results.csv"
+    pd.DataFrame(results).to_csv(pathlib.Path(output_dir) / output_file, index=False)
 
 
 if __name__ == "__main__":

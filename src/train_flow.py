@@ -23,9 +23,9 @@ import eval_flow as _eval
 import generate_data
 import model as _model
 import train_expert
+import compute_robot_indices
 
 WANDB_PROJECT = "rtc-kinetix-bc"
-LOG_DIR = pathlib.Path("logs-bc")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,6 +48,7 @@ class Config:
     batch_size: int = 512
     num_epochs: int = 32
     seed: int = 0
+    output_dir: str = "logs-bc"
 
     eval: _eval.EvalConfig = _eval.EvalConfig()
 
@@ -55,6 +56,7 @@ class Config:
     grad_norm_clip: float = 10.0
     weight_decay: float = 1e-2
     lr_warmup_steps: int = 1000
+    async_interval: int = 0  # If > 0, randomly delay actions by 0 to async_interval-1 steps
 
 
 @struct.dataclass
@@ -88,10 +90,11 @@ def main(config: Config):
         # data has shape: (num_levels, num_steps, num_envs, ...)
         # flatten envs and steps together for learning
         data = jax.tree.map(lambda *x: einops.rearrange(jnp.stack(x), "l s e ... -> l (e s) ..."), *data)
-        # truncate to multiple of batch size
-        valid_steps = data["obs"].shape[1] - action_chunk_size + 1
+        # truncate to multiple of batch size (reserve extra for async_interval)
+        max_async = max(0, config.async_interval - 1) if config.async_interval > 0 else 0
+        valid_steps = data["obs"].shape[1] - action_chunk_size - max_async + 1
         data = jax.tree.map(
-            lambda x: x[:, : (valid_steps // config.batch_size) * config.batch_size + action_chunk_size - 1], data
+            lambda x: x[:, : (valid_steps // config.batch_size) * config.batch_size + action_chunk_size + max_async - 1], data
         )
         # put on device
         data = jax.tree.map(
@@ -111,6 +114,13 @@ def main(config: Config):
 
     obs_dim = data.obs.shape[-1]
     action_dim = env.action_space(env_params).shape[0]
+
+    # Compute robot masks for async training
+    robot_masks = None
+    if config.async_interval > 0:
+        print(f"Async delay augmentation: [0, {config.async_interval})")
+        robot_masks = jnp.stack([compute_robot_indices.compute_robot_mask(p, obs_dim) for p in config.level_paths])
+        robot_masks = jax.device_put(robot_masks, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("level")))
 
     @functools.partial(jax.jit, in_shardings=sharding, out_shardings=sharding)
     @jax.vmap
@@ -139,7 +149,7 @@ def main(config: Config):
 
     @functools.partial(jax.jit, donate_argnums=(0,), in_shardings=sharding, out_shardings=sharding)
     @jax.vmap
-    def train_epoch(epoch_carry: EpochCarry, level: kenv_state.EnvState, data: generate_data.Data):
+    def train_epoch(epoch_carry: EpochCarry, level: kenv_state.EnvState, data: generate_data.Data, robot_mask):
         def train_minibatch(carry: tuple[jax.Array, nnx.State], batch_idxs: jax.Array):
             rng, train_state = carry
             policy, optimizer = nnx.merge(epoch_carry.graphdef, train_state)
@@ -147,21 +157,29 @@ def main(config: Config):
             rng, key = jax.random.split(rng)
 
             def loss_fn(policy: _model.FlowPolicy):
-                obs = data.obs[batch_idxs]
-                action_chunks = data.action[batch_idxs[:, None] + jnp.arange(action_chunk_size)[None, :]]
-                # zero actions after done
-                done_chunks = data.done[batch_idxs[:, None] + jnp.arange(action_chunk_size)[None, :]]
-                done_idxs = jnp.where(
-                    jnp.any(done_chunks, axis=-1),
-                    jnp.argmax(done_chunks, axis=-1),
-                    action_chunk_size,
-                )
-                action_chunks = jnp.where(
-                    jnp.arange(action_chunk_size)[None, :, None] >= done_idxs[:, None, None],
-                    0.0,
-                    action_chunks,
-                )
-                return policy.loss(key, obs, action_chunks)
+                obs_current = data.obs[batch_idxs]
+                
+                if config.async_interval > 0:
+                    # Sample random delay for each batch element
+                    rng_local, key_delay = jax.random.split(key)
+                    delays = jax.random.randint(key_delay, (batch_idxs.shape[0],), 0, config.async_interval)
+                    
+                    # Mix: env@current + robot@future
+                    obs_future = data.obs[batch_idxs + delays]
+                    obs = jnp.where(robot_mask[None, :], obs_future, obs_current)
+                    
+                    # Shift action targets by delay
+                    action_indices = batch_idxs[:, None] + delays[:, None] + jnp.arange(action_chunk_size)[None, :]
+                else:
+                    rng_local = key
+                    obs = obs_current
+                    action_indices = batch_idxs[:, None] + jnp.arange(action_chunk_size)[None, :]
+                
+                action_chunks = data.action[action_indices]
+                done_chunks = data.done[action_indices]
+                done_idxs = jnp.where(jnp.any(done_chunks, axis=-1), jnp.argmax(done_chunks, axis=-1), action_chunk_size)
+                action_chunks = jnp.where(jnp.arange(action_chunk_size)[None, :, None] >= done_idxs[:, None, None], 0.0, action_chunks)
+                return policy.loss(rng_local, obs, action_chunks)
 
             loss, grads = nnx.value_and_grad(loss_fn)(policy)
             info = {"loss": loss, "grad_norm": optax.global_norm(grads)}
@@ -171,7 +189,8 @@ def main(config: Config):
 
         # shuffle
         rng, key = jax.random.split(epoch_carry.rng)
-        permutation = jax.random.permutation(key, data.obs.shape[0] - action_chunk_size + 1)
+        max_async = max(0, config.async_interval - 1) if config.async_interval > 0 else 0
+        permutation = jax.random.permutation(key, data.obs.shape[0] - action_chunk_size - max_async + 1)
         # batch
         permutation = permutation.reshape(-1, config.batch_size)
         # train
@@ -190,17 +209,22 @@ def main(config: Config):
         video = None
         return EpochCarry(rng, train_state, epoch_carry.graphdef), ({**train_info, **eval_info}, video)
 
-    wandb.init(project=WANDB_PROJECT)
+    wandb.init(project=WANDB_PROJECT, config=dataclasses.asdict(config))
     rng = jax.random.key(config.seed)
     epoch_carry = init(jax.random.split(rng, len(config.level_paths)))
+    
+    # Dummy mask if async_interval=0
+    dummy_masks = jnp.zeros((len(config.level_paths), obs_dim), dtype=bool)
+    masks = robot_masks if robot_masks is not None else dummy_masks
+    
     for epoch_idx in tqdm.tqdm(range(config.num_epochs)):
-        epoch_carry, (info, video) = train_epoch(epoch_carry, levels, data)
+        epoch_carry, (info, video) = train_epoch(epoch_carry, levels, data, masks)
 
         for i in range(len(config.level_paths)):
             level_name = config.level_paths[i].replace("/", "_").replace(".json", "")
             wandb.log({f"{level_name}/{k}": v[i] for k, v in info.items()}, step=epoch_idx)
 
-            log_dir = LOG_DIR / wandb.run.name / str(epoch_idx)
+            log_dir = pathlib.Path(config.output_dir) / str(epoch_idx)
 
             if video is not None:
                 video_dir = log_dir / "videos"
