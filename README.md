@@ -1,7 +1,5 @@
 # VLASH Kinetix Simulation Benchmark
 
-Simulated experiments for real-time execution with VLASH method.
-
 ## Installation
 
 ```bash
